@@ -49,6 +49,128 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
       refute StreamableHTTP.get_sse_handler(transport, session_id)
     end
 
+    test "register_sse_handler/3 stores subscriber metadata", %{transport: transport} do
+      session_id = "metadata-session"
+      handler_pid = self()
+
+      subscriber = %{
+        session_id: session_id,
+        handler_pid: handler_pid,
+        project: "forge-symphony",
+        operator_role: "implementer"
+      }
+
+      assert :ok = StreamableHTTP.register_sse_handler(transport, session_id, subscriber)
+
+      state = :sys.get_state(transport)
+
+      assert %{
+               session_id: ^session_id,
+               handler_pid: ^handler_pid,
+               project: "forge-symphony",
+               operator_role: "implementer",
+               registered_at: %DateTime{}
+             } = Map.fetch!(state.sse_handlers, {session_id, handler_pid})
+    end
+
+    test "register_sse_handler/2 stores compatibility subscriber metadata", %{
+      transport: transport
+    } do
+      session_id = "compat-session"
+      handler_pid = self()
+
+      assert :ok = StreamableHTTP.register_sse_handler(transport, session_id)
+
+      state = :sys.get_state(transport)
+
+      assert %{
+               session_id: ^session_id,
+               handler_pid: ^handler_pid,
+               project: nil,
+               operator_role: nil,
+               registered_at: %DateTime{}
+             } = Map.fetch!(state.sse_handlers, {session_id, handler_pid})
+    end
+
+    test "unregister_sse_handler/3 removes by session and handler pid", %{
+      transport: transport
+    } do
+      session_id = "unregister-session"
+      handler_pid = self()
+
+      assert :ok =
+               StreamableHTTP.register_sse_handler(transport, session_id, %{
+                 session_id: session_id,
+                 handler_pid: handler_pid,
+                 project: "forge-symphony",
+                 operator_role: "operator"
+               })
+
+      assert :ok = StreamableHTTP.unregister_sse_handler(transport, session_id, handler_pid)
+      state = :sys.get_state(transport)
+
+      refute Map.has_key?(state.sse_handlers, {session_id, handler_pid})
+    end
+
+    test "handler_count/1 returns total and handler_count/2 scopes by project", %{
+      transport: transport
+    } do
+      test_pid = self()
+
+      first_handler =
+        spawn(fn ->
+          :ok =
+            StreamableHTTP.register_sse_handler(transport, "project-a-session", %{
+              session_id: "project-a-session",
+              handler_pid: self(),
+              project: "project-a",
+              operator_role: "operator"
+            })
+
+          send(test_pid, {:registered, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      second_handler =
+        spawn(fn ->
+          :ok =
+            StreamableHTTP.register_sse_handler(transport, "project-b-session", %{
+              session_id: "project-b-session",
+              handler_pid: self(),
+              project: "project-b",
+              operator_role: "operator"
+            })
+
+          send(test_pid, {:registered, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:registered, ^first_handler}
+      assert_receive {:registered, ^second_handler}
+
+      assert StreamableHTTP.handler_count(transport) == 2
+      assert StreamableHTTP.handler_count(transport, {:project, "project-a"}) == 1
+      assert StreamableHTTP.handler_count(transport, {:project, "project-b"}) == 1
+
+      send(first_handler, :stop)
+      send(second_handler, :stop)
+    end
+
+    test "compatibility-registered handlers are excluded from project-scoped counts", %{
+      transport: transport
+    } do
+      assert :ok = StreamableHTTP.register_sse_handler(transport, "compat-count-session")
+
+      assert StreamableHTTP.handler_count(transport) == 1
+      assert StreamableHTTP.handler_count(transport, {:project, "forge-symphony"}) == 0
+    end
+
     test "stale unregister cannot remove a newer handler", %{transport: transport} do
       session_id = "test-session-race"
       test_pid = self()

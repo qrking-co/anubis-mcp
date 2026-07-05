@@ -99,7 +99,32 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   """
   @spec register_sse_handler(GenServer.server(), String.t()) :: :ok | {:error, term()}
   def register_sse_handler(transport, session_id) do
-    GenServer.call(transport, {:register_sse_handler, session_id, self()}, 5000)
+    register_sse_handler(transport, session_id, %{
+      session_id: session_id,
+      handler_pid: self(),
+      project: nil,
+      operator_role: nil
+    })
+  end
+
+  @doc """
+  Registers subscriber metadata for the calling SSE handler.
+
+  The transport stores the metadata as the `sse_handlers` value and keys it by
+  `{session_id, handler_pid}` so reconnect cleanup can remove exactly the
+  handler that closed. Missing compatibility fields are filled at the boundary.
+  """
+  @spec register_sse_handler(GenServer.server(), String.t(), map()) :: :ok | {:error, term()}
+  def register_sse_handler(transport, session_id, subscriber) when is_map(subscriber) do
+    subscriber =
+      subscriber
+      |> Map.put(:session_id, session_id)
+      |> Map.put_new(:handler_pid, self())
+      |> Map.put_new(:project, nil)
+      |> Map.put_new(:operator_role, nil)
+      |> Map.put_new(:registered_at, DateTime.utc_now())
+
+    GenServer.call(transport, {:register_sse_handler, subscriber}, 5000)
   end
 
   @doc """
@@ -108,6 +133,27 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   @spec unregister_sse_handler(GenServer.server(), String.t(), pid() | nil) :: :ok
   def unregister_sse_handler(transport, session_id, expected_pid \\ nil) do
     GenServer.cast(transport, {:unregister_sse_handler, session_id, expected_pid})
+  end
+
+  @doc """
+  Returns the total connected SSE handler count.
+  """
+  @spec handler_count(GenServer.server()) :: non_neg_integer()
+  def handler_count(transport) do
+    GenServer.call(transport, :handler_count)
+  end
+
+  @doc """
+  Returns the connected SSE handler count for a supported scope.
+
+  Currently supported scopes:
+
+    * `{:project, project}` - handlers whose subscriber metadata has the given
+      non-nil project.
+  """
+  @spec handler_count(GenServer.server(), {:project, term()}) :: non_neg_integer()
+  def handler_count(transport, scope) do
+    GenServer.call(transport, {:handler_count, scope})
   end
 
   @doc """
@@ -192,10 +238,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
-  def handle_call({:register_sse_handler, session_id, pid}, _from, state) do
+  def handle_call({:register_sse_handler, subscriber}, _from, state) do
+    session_id = Map.fetch!(subscriber, :session_id)
+    pid = Map.fetch!(subscriber, :handler_pid)
+
     sse_handlers =
-      case Map.get(state.sse_handlers, session_id) do
-        {_old_pid, old_ref} ->
+      case find_handler_by_session(state.sse_handlers, session_id) do
+        {{_session_id, _old_pid} = old_key, %{monitor_ref: old_ref}} ->
           # A connection is (re)binding to this session. Stop monitoring the
           # handler currently bound to it, but do NOT send :close_sse to a
           # superseded handler. A server-initiated close prompts spec-compliant
@@ -206,14 +255,15 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
           # the expected_pid guard in unregister_sse_handler keeps its eventual
           # close from dropping the handler that took over.
           Process.demonitor(old_ref, [:flush])
-          state.sse_handlers
+          Map.delete(state.sse_handlers, old_key)
 
         nil ->
           state.sse_handlers
       end
 
     ref = Process.monitor(pid)
-    sse_handlers = Map.put(sse_handlers, session_id, {pid, ref})
+    subscriber = Map.put(subscriber, :monitor_ref, ref)
+    sse_handlers = Map.put(sse_handlers, {session_id, pid}, subscriber)
 
     Logging.transport_event("sse_handler_registered", %{
       session_id: session_id,
@@ -260,10 +310,25 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_call({:get_sse_handler, session_id}, _from, state) do
-    case Map.get(state.sse_handlers, session_id) do
-      {pid, _ref} -> {:reply, pid, state}
+    case find_handler_by_session(state.sse_handlers, session_id) do
+      {{_session_id, pid}, _subscriber} -> {:reply, pid, state}
       nil -> {:reply, nil, state}
     end
+  end
+
+  @impl GenServer
+  def handle_call(:handler_count, _from, state) do
+    {:reply, map_size(state.sse_handlers), state}
+  end
+
+  @impl GenServer
+  def handle_call({:handler_count, {:project, project}}, _from, state) do
+    count =
+      Enum.count(state.sse_handlers, fn {_key, subscriber} ->
+        Map.get(subscriber, :project) == project and not is_nil(project)
+      end)
+
+    {:reply, count, state}
   end
 
   @impl GenServer
@@ -295,13 +360,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_cast({:unregister_sse_handler, session_id, expected_pid}, state) do
-    case Map.get(state.sse_handlers, session_id) do
-      {pid, _ref} when is_pid(expected_pid) and pid != expected_pid ->
+    case find_handler_by_session(state.sse_handlers, session_id) do
+      {{_session_id, pid}, _subscriber} when is_pid(expected_pid) and pid != expected_pid ->
         {:noreply, state}
 
-      {_pid, ref} ->
+      {{_session_id, _pid} = key, %{monitor_ref: ref}} ->
         Process.demonitor(ref, [:flush])
-        state = %{state | sse_handlers: Map.delete(state.sse_handlers, session_id)}
+        state = %{state | sse_handlers: Map.delete(state.sse_handlers, key)}
         {:noreply, schedule_close_if_open(state, session_id)}
 
       nil ->
@@ -319,7 +384,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   def handle_cast(:shutdown, state) do
     Logging.transport_event("shutdown", %{transport: :streamable_http}, level: :info)
 
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
+    for {{_session_id, pid}, _subscriber} <- state.sse_handlers do
       send(pid, :close_sse)
     end
 
@@ -338,9 +403,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       nil ->
         {:noreply, state}
 
-      session_id ->
+      {_session_id, _pid} = key ->
         Logging.transport_event("sse_handler_down", %{reason: inspect(reason)})
-        state = %{state | sse_handlers: Map.delete(state.sse_handlers, session_id)}
+        state = %{state | sse_handlers: Map.delete(state.sse_handlers, key)}
+        {session_id, _pid} = key
         {:noreply, schedule_close_if_open(state, session_id)}
     end
   end
@@ -350,7 +416,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       not Map.has_key?(state.stream_timers, session_id) ->
         {:noreply, state}
 
-      Map.has_key?(state.sse_handlers, session_id) ->
+      session_connected?(state.sse_handlers, session_id) ->
         {:noreply, %{state | stream_timers: Map.delete(state.stream_timers, session_id)}}
 
       true ->
@@ -359,7 +425,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   def handle_info(:send_keepalive, state) do
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
+    for {{_session_id, pid}, _subscriber} <- state.sse_handlers do
       send(pid, :sse_keepalive)
     end
 
@@ -419,8 +485,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   defp route(%{event_store: nil} = state, session_id, message) do
-    case Map.get(state.sse_handlers, session_id) do
-      {pid, _ref} ->
+    case find_handler_by_session(state.sse_handlers, session_id) do
+      {{_session_id, pid}, _subscriber} ->
         send(pid, {:sse_message, message})
         {:reply, :ok, state}
 
@@ -439,7 +505,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   defp broadcast(%{event_store: nil} = state, message) do
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
+    for {{_session_id, pid}, _subscriber} <- state.sse_handlers do
       send(pid, {:sse_message, message})
     end
 
@@ -460,13 +526,20 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   defp record_and_deliver({mod, name}, sse_handlers, session_id, message) do
     case mod.append(name, session_id, message) do
       {:ok, id} ->
-        case Map.get(sse_handlers, session_id) do
-          {pid, _ref} -> send(pid, {:sse_message, message, id})
+        case find_handler_by_session(sse_handlers, session_id) do
+          {{_session_id, pid}, _subscriber} -> send(pid, {:sse_message, message, id})
           nil -> :ok
         end
 
       {:error, reason} ->
-        Logging.transport_event("sse_record_failed", %{session_id: session_id, reason: inspect(reason)}, level: :warning)
+        Logging.transport_event(
+          "sse_record_failed",
+          %{
+            session_id: session_id,
+            reason: inspect(reason)
+          },
+          level: :warning
+        )
     end
   end
 
@@ -505,8 +578,20 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   defp find_handler_session(sse_handlers, pid, ref) do
-    Enum.find_value(sse_handlers, fn {session_id, {handler_pid, monitor_ref}} ->
-      if handler_pid == pid and monitor_ref == ref, do: session_id
+    Enum.find_value(sse_handlers, fn {{_session_id, handler_pid} = key, subscriber} ->
+      if handler_pid == pid and Map.get(subscriber, :monitor_ref) == ref do
+        key
+      end
     end)
+  end
+
+  defp find_handler_by_session(sse_handlers, session_id) do
+    Enum.find(sse_handlers, fn {{handler_session_id, _pid}, _subscriber} ->
+      handler_session_id == session_id
+    end)
+  end
+
+  defp session_connected?(sse_handlers, session_id) do
+    match?({_key, _subscriber}, find_handler_by_session(sse_handlers, session_id))
   end
 end
