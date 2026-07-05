@@ -268,6 +268,125 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
       end)
     end
 
+    test "send_message_to_session/4 delivers only to the target session", %{
+      transport: transport
+    } do
+      test_pid = self()
+
+      session_a =
+        spawn(fn ->
+          :ok = StreamableHTTP.register_sse_handler(transport, "session-a")
+          send(test_pid, {:registered, "session-a", self()})
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:delivered, "session-a", message})
+            :stop -> :ok
+          end
+        end)
+
+      session_b =
+        spawn(fn ->
+          :ok = StreamableHTTP.register_sse_handler(transport, "session-b")
+          send(test_pid, {:registered, "session-b", self()})
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:delivered, "session-b", message})
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:registered, "session-a", ^session_a}
+      assert_receive {:registered, "session-b", ^session_b}
+
+      assert :ok =
+               StreamableHTTP.send_message_to_session(
+                 transport,
+                 "session-a",
+                 "targeted-session",
+                 timeout: 5000
+               )
+
+      assert_receive {:delivered, "session-a", "targeted-session"}
+      refute_receive {:delivered, "session-b", "targeted-session"}, 100
+
+      send(session_a, :stop)
+      send(session_b, :stop)
+    end
+
+    test "send_message_to_project/4 delivers only to matching project subscribers", %{
+      transport: transport
+    } do
+      test_pid = self()
+
+      project_a =
+        spawn(fn ->
+          :ok =
+            StreamableHTTP.register_sse_handler(transport, "project-a-session", %{
+              session_id: "project-a-session",
+              handler_pid: self(),
+              project: "project-a",
+              operator_role: "operator"
+            })
+
+          send(test_pid, {:registered, "project-a", self()})
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:delivered, "project-a", message})
+            :stop -> :ok
+          end
+        end)
+
+      project_b =
+        spawn(fn ->
+          :ok =
+            StreamableHTTP.register_sse_handler(transport, "project-b-session", %{
+              session_id: "project-b-session",
+              handler_pid: self(),
+              project: "project-b",
+              operator_role: "operator"
+            })
+
+          send(test_pid, {:registered, "project-b", self()})
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:delivered, "project-b", message})
+            :stop -> :ok
+          end
+        end)
+
+      assert :ok = StreamableHTTP.register_sse_handler(transport, "compat-project-session")
+
+      assert_receive {:registered, "project-a", ^project_a}
+      assert_receive {:registered, "project-b", ^project_b}
+
+      assert :ok =
+               StreamableHTTP.send_message_to_project(
+                 transport,
+                 "project-a",
+                 "targeted-project",
+                 timeout: 5000
+               )
+
+      assert_receive {:delivered, "project-a", "targeted-project"}
+      refute_receive {:delivered, "project-b", "targeted-project"}, 100
+      refute_receive {:sse_message, "targeted-project"}, 100
+
+      send(project_a, :stop)
+      send(project_b, :stop)
+    end
+
+    test "send_message_to_subscribers/4 accepts subscriber selectors", %{
+      transport: transport
+    } do
+      assert :ok =
+               StreamableHTTP.send_message_to_subscribers(
+                 transport,
+                 fn subscriber -> Map.get(subscriber, :operator_role) == "operator" end,
+                 "selector-message",
+                 timeout: 5000
+               )
+    end
+
     test "cleans up handlers when they crash", %{transport: transport} do
       session_id = "test-session-crash"
       test_pid = self()

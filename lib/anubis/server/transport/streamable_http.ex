@@ -83,6 +83,49 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     GenServer.call(transport, {:send_message, message}, opts[:timeout])
   end
 
+  @doc """
+  Sends a message to the SSE handler registered for a single session.
+
+  When resumability is enabled the message is also recorded on the session's
+  stream so it can be replayed on reconnect. The message is recorded even if no
+  handler is currently attached, matching `route_to_session/3` compatibility
+  semantics.
+  """
+  @spec send_message_to_session(GenServer.server(), String.t(), binary(), keyword()) ::
+          :ok | {:error, term()}
+  def send_message_to_session(transport, session_id, message, opts) when is_binary(session_id) and is_binary(message) do
+    GenServer.call(transport, {:send_message_to_session, session_id, message}, opts[:timeout])
+  end
+
+  @doc """
+  Sends a message to handlers whose subscriber metadata matches `project`.
+
+  Compatibility-registered handlers have `project: nil` and are not treated as
+  wildcard subscribers for project-scoped delivery.
+  """
+  @spec send_message_to_project(GenServer.server(), term(), binary(), keyword()) ::
+          :ok | {:error, term()}
+  def send_message_to_project(transport, project, message, opts) when is_binary(message) do
+    GenServer.call(transport, {:send_message_to_project, project, message}, opts[:timeout])
+  end
+
+  @doc """
+  Sends a message to handlers whose subscriber metadata satisfies `selector`.
+
+  The selector receives each stored subscriber metadata map and must return a
+  truthy value for subscribers that should receive the message.
+  """
+  @spec send_message_to_subscribers(
+          GenServer.server(),
+          (map() -> as_boolean(term())),
+          binary(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def send_message_to_subscribers(transport, selector, message, opts)
+      when is_function(selector, 1) and is_binary(message) do
+    GenServer.call(transport, {:send_message_to_subscribers, selector, message}, opts[:timeout])
+  end
+
   @impl Transport
   @spec shutdown(GenServer.server()) :: :ok
   def shutdown(transport) do
@@ -337,6 +380,21 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
+  def handle_call({:send_message_to_session, session_id, message}, _from, state) do
+    route(state, session_id, message)
+  end
+
+  @impl GenServer
+  def handle_call({:send_message_to_project, project, message}, _from, state) do
+    targeted(state, message, &project_subscriber?(&1, project))
+  end
+
+  @impl GenServer
+  def handle_call({:send_message_to_subscribers, selector, message}, _from, state) do
+    targeted(state, message, selector)
+  end
+
+  @impl GenServer
   def handle_call({:send_message, message}, _from, state) do
     Logging.transport_event("broadcast_notification", %{
       message_size: byte_size(message),
@@ -518,6 +576,36 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     end
 
     :ok
+  end
+
+  defp targeted(%{event_store: nil} = state, message, selector) do
+    state.sse_handlers
+    |> matching_subscribers(selector)
+    |> Enum.each(fn {_session_id, pid} ->
+      send(pid, {:sse_message, message})
+    end)
+
+    {:reply, :ok, state}
+  end
+
+  defp targeted(%{event_store: {_mod, _name} = store} = state, message, selector) do
+    state.sse_handlers
+    |> matching_subscribers(selector)
+    |> Enum.each(fn {session_id, _pid} ->
+      record_and_deliver(store, state.sse_handlers, session_id, message)
+    end)
+
+    {:reply, :ok, state}
+  end
+
+  defp matching_subscribers(sse_handlers, selector) do
+    Enum.flat_map(sse_handlers, fn {{session_id, pid}, subscriber} ->
+      if selector.(subscriber), do: [{session_id, pid}], else: []
+    end)
+  end
+
+  defp project_subscriber?(subscriber, project) do
+    Map.get(subscriber, :project) == project and not is_nil(project)
   end
 
   # Records the event, then delivers it live (with its store id) only if it was
