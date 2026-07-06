@@ -136,21 +136,6 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   def supported_protocol_versions, do: ["2025-03-26", "2025-06-18"]
 
   @doc """
-  Registers the calling process as the SSE handler for a session.
-
-  Called by the Plug when establishing an SSE connection.
-  """
-  @spec register_sse_handler(GenServer.server(), String.t()) :: :ok | {:error, term()}
-  def register_sse_handler(transport, session_id) do
-    register_sse_handler(transport, session_id, %{
-      session_id: session_id,
-      handler_pid: self(),
-      project: nil,
-      operator_role: nil
-    })
-  end
-
-  @doc """
   Registers subscriber metadata for the calling SSE handler.
 
   The transport stores the metadata as the `sse_handlers` value and keys it by

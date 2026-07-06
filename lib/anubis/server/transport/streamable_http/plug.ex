@@ -113,7 +113,10 @@ if Code.ensure_loaded?(Plug) do
         session_id = get_or_create_session_id(conn, session_header)
         resume_from = parse_last_event_id(conn)
 
-        case StreamableHTTP.register_sse_handler(transport, session_id) do
+        case StreamableHTTP.register_sse_handler(transport, session_id, %{
+               session_id: session_id,
+               handler_pid: self()
+             }) do
           :ok ->
             params =
               opts
